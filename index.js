@@ -13,11 +13,12 @@ const port = process.env.PORT || 5000;
 const app = express();
 const cors = require('cors');
 require('dotenv').config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET);
 
 // eyeside-firebase-adminsdk.json
-var admin = require('firebase-admin');
+const admin = require('firebase-admin');
 
-var serviceAccount = require('./eyeside-firebase-adminsdk.json');
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
 	credential: admin.credential.cert(serviceAccount),
@@ -26,8 +27,6 @@ admin.initializeApp({
 // middleware
 app.use(cors());
 app.use(express.json());
-
-console.log(process.env.DB_USER);
 
 // mongodb initialization
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.6vvik.mongodb.net/myFirstDatabase?retryWrites=true&w=majority`;
@@ -80,6 +79,30 @@ async function run() {
 			res.json({ admin: isAdmin });
 		});
 
+		// storing user signed in with google
+		app.put('/adduser', async (req, res) => {
+			const user = req.body;
+
+			const filter = { email: user.email };
+			const options = { upsert: true };
+			const updateUser = { $set: user };
+			const result = await userCollection.updateOne(
+				filter,
+				updateUser,
+				options
+			);
+
+			res.json(result);
+		});
+
+		//storing new registered user
+		app.post('/adduser', async (req, res) => {
+			const newUser = req.body;
+
+			const result = await userCollection.insertOne(newUser);
+			res.json(result);
+		});
+
 		// sending products
 		app.get('/products', async (req, res) => {
 			const size = parseInt(req.query.size);
@@ -107,14 +130,61 @@ async function run() {
 			res.json(product);
 		});
 
+		// sending products in the cart
+		app.post('/cart/products', async (req, res) => {
+			const { itemCart } = req.body;
+			const cartArray = [...Object.keys(itemCart)];
+
+			const indexedCart = cartArray.map((_id) => ObjectId(_id));
+
+			const query = { _id: { $in: indexedCart } };
+			const cursor = productCollection.find(query);
+
+			const products = await cursor.toArray();
+
+			res.json(products);
+		});
+
 		// sending client orders
 		app.get('/myorders/:uid', async (req, res) => {
 			const uid = req.params.uid;
-			const query = { 'user.user_uid': uid };
+			const query = { user_uid: uid };
 			const cursor = orderCollection.find(query);
 			const myOrders = await cursor.toArray();
 
 			res.json(myOrders);
+		});
+
+		// sending client single order
+		app.get('/order/:_id', async (req, res) => {
+			const _id = req.params._id;
+			const query = { _id: ObjectId(_id) };
+
+			const order = await orderCollection.findOne(query);
+
+			res.send(order);
+		});
+
+		// storing user orders
+		app.post('/order', async (req, res) => {
+			const order = req.body;
+
+			const result = await orderCollection.insertOne(order);
+
+			res.json(result);
+		});
+
+		//updating order payment status
+		app.put('/order/:_id', async (req, res) => {
+			const _id = req.params._id;
+			const payment = req.body;
+
+			const filter = { _id: ObjectId(_id) };
+			const updateDoc = { $set: payment };
+
+			const result = await orderCollection.updateOne(filter, updateDoc);
+
+			res.json(result);
 		});
 
 		// sending all reviews
@@ -125,44 +195,11 @@ async function run() {
 			res.json(reviews);
 		});
 
-		// storing user orders
-		app.post('/placeorder', async (req, res) => {
-			const order = req.body;
-
-			const result = await orderCollection.insertOne(order);
-
-			res.json(result);
-		});
-
-		//storing new registered user
-		app.post('/adduser', async (req, res) => {
-			const newUser = req.body;
-
-			const result = await userCollection.insertOne(newUser);
-			res.json(result);
-		});
-
 		// storing new review from users
 		app.post('/addreview', verifyToken, async (req, res) => {
 			const newReview = req.body;
 
 			const result = await reviewCollection.insertOne(newReview);
-			res.json(result);
-		});
-
-		// storing user signed in with google
-		app.put('/adduser', async (req, res) => {
-			const user = req.body;
-
-			const filter = { email: user.email };
-			const options = { upsert: true };
-			const updateUser = { $set: user };
-			const result = await userCollection.updateOne(
-				filter,
-				updateUser,
-				options
-			);
-
 			res.json(result);
 		});
 
@@ -187,18 +224,25 @@ async function run() {
 
 		// updating status of the orders
 		app.put('/admin/status/:_id', verifyToken, async (req, res) => {
-			const status = req.body.status;
+			const newStatus = req.body.status;
 			const _id = req.params._id;
 
+			console.log(newStatus);
+
 			const filter = { _id: ObjectId(_id) };
+			const options = { upsert: true };
 
 			const updateOrder = {
 				$set: {
-					order_status: status,
+					status: newStatus,
 				},
 			};
 
-			const result = await orderCollection.updateOne(filter, updateOrder);
+			const result = await orderCollection.updateOne(
+				filter,
+				updateOrder,
+				options
+			);
 
 			res.json(result);
 		});
@@ -207,7 +251,6 @@ async function run() {
 		app.put('/admin/addadmin', verifyToken, async (req, res) => {
 			const user = req.body;
 			const requesterEmail = req.decodedEmail;
-			console.log(requesterEmail);
 
 			// checking if email exists on the database
 			if (requesterEmail) {
@@ -242,6 +285,20 @@ async function run() {
 			const result = await orderCollection.deleteOne(query);
 
 			res.json(result);
+		});
+
+		app.post('/create-payment-intent', async (req, res) => {
+			const paymentInfo = req.body;
+
+			const amount = Math.round(paymentInfo.price * 100); // stripe always takes amount is cents, so we have to multiply with 100 always.
+
+			const paymentIntent = await stripe.paymentIntents.create({
+				amount: amount,
+				currency: 'usd',
+				payment_method_types: ['card'],
+			});
+
+			res.json({ clientSecret: paymentIntent.client_secret });
 		});
 	} finally {
 		await client.close();
